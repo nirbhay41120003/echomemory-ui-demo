@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title desc">
+  <title id="title">EchoMemory mark</title>
+  <desc id="desc">A blue echo ring surrounding a central memory point.</desc>
+  <rect width="64" height="64" rx="16" fill="#16171c"/>
+  <circle cx="32" cy="32" r="18" fill="none" stroke="#2b4eff" stroke-width="4"/>
+  <circle cx="32" cy="32" r="6" fill="#2b4eff"/>
+  <path d="M32 8a24 24 0 0 1 24 24M32 56A24 24 0 0 1 8 32" fill="none" stroke="#9aaeff" stroke-width="2.5" stroke-linecap="round"/>
+</svg>
