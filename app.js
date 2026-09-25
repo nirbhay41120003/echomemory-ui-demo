@@ -285,12 +285,21 @@ async function loadStatus() {
   try {
     const data = await fetch("/api/status").then((response) => response.json());
     activeAsr = data.active_asr || "sarvam_ai"; activeLlm = data.active_llm || "groq_gpt_oss_20b";
-    $("sarvam-key-status").textContent = data.sarvam_configured && data.groq_configured
+    const configured = data.configured ?? (data.sarvam_configured && data.groq_configured);
+    const missing = Array.isArray(data.missing) ? data.missing : [
+      ...(!data.sarvam_configured ? ["SARVAM_API_KEY"] : []),
+      ...(!data.groq_configured ? ["GROQ_API_KEY"] : []),
+    ];
+    const missingText = missing.length ? `Missing in this deployment: ${missing.join(", ")}.` : "";
+    $("sarvam-key-status").textContent = configured
       ? "Cloud demo ready · Sarvam AI speech + Groq AI memory and chat. Keys remain on the Vercel server."
-      : "Demo needs SARVAM_API_KEY and GROQ_API_KEY in Vercel environment variables.";
-    setStatus(data.sarvam_configured && data.groq_configured ? "Cloud demo ready" : "Demo needs setup", data.sarvam_configured && data.groq_configured ? "" : "warn");
+      : missingText;
+    setStatus(configured ? "Cloud demo ready" : "Demo needs setup", configured ? "" : "warn");
     $("hint").textContent = "Cloud demo: Sarvam AI transcribes, Groq polishes and answers.";
-  } catch (_) { setStatus("Demo API unavailable", "warn"); }
+  } catch (_) {
+    setStatus("Demo API unavailable", "warn");
+    $("sarvam-key-status").textContent = "The deployment could not reach /api/status. Check that this project is deployed from the repository root.";
+  }
 }
 
 function setSarvamState(configured, current) {

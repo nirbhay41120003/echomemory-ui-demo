@@ -12,7 +12,7 @@ export function methodNotAllowed(response, allowed = "POST") {
 }
 
 export function requireEnv(response, name) {
-  if (!process.env[name]) {
+  if (!String(process.env[name] || "").trim()) {
     response.status(503).json({ error: `The demo is not configured: ${name} is missing.` });
     return false;
   }
