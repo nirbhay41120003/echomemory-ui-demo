@@ -1,6 +1,6 @@
-let socket, stream, processor, audioContext, timerInterval, modelPoll, isCapturing = false;
-let activeAsr = null;
-let activeLlm = null;
+let stream, recorder, audioChunks = [], timerInterval, modelPoll, isCapturing = false;
+let activeAsr = "sarvam_ai";
+let activeLlm = "groq_gpt_oss_20b";
 let finalized = [], partial = "", captureSaveFailed = false;
 const demoMemories = JSON.parse(localStorage.getItem("echomemory-demo-memories") || "[]");
 const $ = (id) => document.getElementById(id);
@@ -54,9 +54,7 @@ function rootMeanSquare(samples) {
 }
 
 function stopAudio() {
-  if (processor) { processor.disconnect(); processor.onaudioprocess = null; processor = null; }
   if (stream) { stream.getTracks().forEach((track) => track.stop()); stream = null; }
-  if (audioContext) { audioContext.close(); audioContext = null; }
   clearInterval(timerInterval);
 }
 
@@ -68,16 +66,57 @@ function startTimer() {
   }, 1000);
 }
 
-function startCapture() {
-  finalized = ["This is a visual demo of EchoMemory."]; partial = ""; captureSaveFailed = false;
-  renderTranscript(); startTimer(); setCaptureButton(true); setStatus("Demo capture", "live"); setTranscriptMode("Listening", "live");
-  $("hint").textContent = "UI preview mode: no microphone or server is connected.";
+async function startCapture() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus" : "audio/webm";
+    recorder = new MediaRecorder(stream, { mimeType });
+    audioChunks = [];
+    recorder.addEventListener("dataavailable", (event) => { if (event.data.size) audioChunks.push(event.data); });
+    recorder.addEventListener("stop", processRecording, { once: true });
+    recorder.start();
+    finalized = []; partial = ""; captureSaveFailed = false;
+    renderTranscript(); startTimer(); setCaptureButton(true); setStatus("Listening with Sarvam", "live"); setTranscriptMode("Listening", "live");
+    $("hint").textContent = "Sarvam AI will transcribe this capture, then Groq will polish it.";
+  } catch (error) {
+    stopAudio(); setStatus("Microphone unavailable", "warn"); $("hint").textContent = error.message || "Microphone permission is required.";
+  }
 }
 
 function finishCapture() {
   setCaptureButton(false); stopAudio();
-  setStatus("Demo saved", ""); setTranscriptMode("Saved", "");
-  if (finalized.length) addDemoMemory(finalized.join(" "));
+  if (recorder && recorder.state !== "inactive") {
+    setStatus("Transcribing with Sarvam…", "busy"); setTranscriptMode("Processing", "busy"); recorder.stop();
+  }
+}
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result).split(",")[1] || "");
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function processRecording() {
+  const blob = new Blob(audioChunks, { type: recorder?.mimeType || "audio/webm" });
+  recorder = null; audioChunks = [];
+  try {
+    const audioBase64 = await blobToBase64(blob);
+    const transcriptResponse = await fetch("/api/transcribe", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ audioBase64, mimeType: blob.type }) });
+    const transcriptData = await transcriptResponse.json();
+    if (!transcriptResponse.ok) throw new Error(transcriptData.error || "Sarvam transcription failed.");
+    if (!transcriptData.transcript) throw new Error("Sarvam did not detect any speech.");
+    setStatus("Polishing with Groq…", "busy");
+    const cleanupResponse = await fetch("/api/cleanup", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: transcriptData.transcript }) });
+    const cleanupData = await cleanupResponse.json();
+    if (!cleanupResponse.ok) throw new Error(cleanupData.error || "Groq cleanup failed.");
+    finalized = [cleanupData.text]; partial = ""; renderTranscript(); addDemoMemory(cleanupData.text);
+    setStatus("Saved with Groq", ""); setTranscriptMode("Saved", "");
+  } catch (error) {
+    captureSaveFailed = true; setStatus(error.message || "Cloud capture failed.", "warn"); setTranscriptMode("Not saved", "warn");
+  }
 }
 
 async function loadSummary() {
@@ -146,9 +185,9 @@ async function saveSarvamKey(event) {
   event.preventDefault();
   const input = $("sarvam-key"), button = event.currentTarget.querySelector("button"), key = input.value.trim();
   if (!key) return;
-  button.disabled = true; button.textContent = "Preview only";
-  $("sarvam-key-status").textContent = "Cloud speech is available in the full desktop app. This static preview never sends or stores API keys.";
-  input.value = ""; setStatus("UI preview", "live");
+  button.disabled = true; button.textContent = "Demo configured";
+  $("sarvam-key-status").textContent = "This demo uses the deployment's server-side Sarvam key. User keys are not accepted in the browser.";
+  input.value = ""; setStatus("Cloud demo", "live");
   setTimeout(() => { button.disabled = false; button.textContent = "Save & use Sarvam"; }, 1200);
 }
 
@@ -158,7 +197,7 @@ async function activateLlm(selected) {
     const data = await response.json();
     if (!response.ok) throw new Error(data.detail || "This chat model could not be loaded.");
     activeLlm = data.active_llm;
-    $("answer").textContent = "Local chat is ready. Ask about your memories.";
+    $("answer").textContent = "Groq chat is ready. Ask about your memories.";
     await Promise.all([loadStatus(), loadModels()]);
   } catch (error) {
     const message = document.createElement("p"); message.className = "model-error"; message.textContent = error.message || "This chat model could not be loaded.";
@@ -225,29 +264,33 @@ $("capture").addEventListener("click", () => isCapturing ? finishCapture() : sta
 $("refresh-summary").addEventListener("click", loadSummary);
 $("chat-form").addEventListener("submit", (event) => {
   event.preventDefault(); const question = $("question").value.trim(); if (!question) return;
-  const match = demoMemories.find((memory) => memory.text.toLowerCase().includes(question.toLowerCase()));
-  $("answer").textContent = match ? match.text : "This is a UI preview. Add a written memory above, then search for matching words.";
-  $("sources").replaceChildren();
+  $("answer").textContent = "Asking Groq…"; $("sources").replaceChildren();
+  fetch("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ question, memories: demoMemories }) })
+    .then(async (response) => { const data = await response.json(); if (!response.ok) throw new Error(data.error || "Groq chat failed."); return data; })
+    .then((data) => { $("answer").textContent = data.answer; data.sources.forEach((source) => { const chip = document.createElement("span"); chip.className = "source"; chip.textContent = `${formatTime(source.created_at)} · ${source.text}`; $("sources").append(chip); }); })
+    .catch((error) => { $("answer").textContent = error.message || "Groq chat failed."; });
 });
-$("save-note").addEventListener("click", () => {
+$("save-note").addEventListener("click", async () => {
   const input = $("note-text"), text = input.value.trim(); if (!text) return;
-  addDemoMemory(text); input.value = ""; $("save-note").textContent = "Saved locally";
+  $("save-note").textContent = "Polishing with Groq…";
+  try {
+    const response = await fetch("/api/cleanup", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text }) });
+    const data = await response.json(); if (!response.ok) throw new Error(data.error || "Groq cleanup failed.");
+    addDemoMemory(data.text); input.value = ""; $("save-note").textContent = "Saved with Groq";
+  } catch (error) { $("save-note").textContent = error.message || "Could not save"; }
   setTimeout(() => { $("save-note").textContent = "Save locally"; }, 1600);
 });
 
 async function loadStatus() {
   try {
     const data = await fetch("/api/status").then((response) => response.json());
-    activeAsr = data.active_asr || null;
-    activeLlm = data.active_llm || null;
-    if (data.sarvam_language_code) $("sarvam-language").value = data.sarvam_language_code;
-    if (data.sarvam_configured) $("sarvam-key-status").textContent = data.active_asr === "asr_sarvam_ai"
-      ? `API saved securely · Currently using Sarvam AI · ${$("sarvam-language").selectedOptions[0].textContent}. Enter a new key only if you want to replace it.`
-      : "API saved securely on this device. Sarvam is available but a local speech model is currently selected.";
-    setSarvamState(data.sarvam_configured, data.active_asr === "asr_sarvam_ai");
-    if (data.asr_ready) setStatus("Ready");
-    else { setStatus("Local model needed", "warn"); $("hint").textContent = "Your data stays local. Download and select a local ASR model to turn speech into text."; }
-  } catch (_) { setStatus("Local server unavailable", "warn"); }
+    activeAsr = data.active_asr || "sarvam_ai"; activeLlm = data.active_llm || "groq_gpt_oss_20b";
+    $("sarvam-key-status").textContent = data.sarvam_configured && data.groq_configured
+      ? "Cloud demo ready · Sarvam AI speech + Groq AI memory and chat. Keys remain on the Vercel server."
+      : "Demo needs SARVAM_API_KEY and GROQ_API_KEY in Vercel environment variables.";
+    setStatus(data.sarvam_configured && data.groq_configured ? "Cloud demo ready" : "Demo needs setup", data.sarvam_configured && data.groq_configured ? "" : "warn");
+    $("hint").textContent = "Cloud demo: Sarvam AI transcribes, Groq polishes and answers.";
+  } catch (_) { setStatus("Demo API unavailable", "warn"); }
 }
 
 function setSarvamState(configured, current) {
@@ -276,11 +319,16 @@ function setSarvamState(configured, current) {
   change.hidden = !configured;
   use.hidden = !configured || current;
 }
-$('sarvam-form').addEventListener('submit', saveSarvamKey);
-setStatus("UI preview", "live");
-$("hint").textContent = "UI preview mode: data stays in this browser only.";
-$("model-list").textContent = "Local models are available in the full desktop app.";
-$("llm-list").textContent = "Local chat models are available in the full desktop app.";
+$('sarvam-form')?.addEventListener('submit', saveSarvamKey);
+setStatus("Checking cloud demo…", "live");
+$("hint").textContent = "Cloud demo: Sarvam AI transcribes, Groq polishes and answers.";
+$("model-list").textContent = "Sarvam AI is the default speech model for this cloud demo.";
+$("llm-list").textContent = "Groq GPT-OSS 20B is the default chat and memory model for this cloud demo.";
+$("sarvam-form")?.remove();
+$("sarvam-key-status") && ($("sarvam-key-status").textContent = "Configured by the Vercel deployment owner. API keys are never entered in the demo.");
+$("model-setup")?.querySelector("h2") && ($("model-setup").querySelector("h2").textContent = "Cloud demo setup");
+$("model-setup")?.querySelector(".panel-section-heading + p") && ($("model-setup").querySelector(".panel-section-heading + p").textContent = "This demo uses Sarvam AI for speech and Groq for memory cleanup and chat. API keys stay on Vercel and are never entered in this browser.");
+loadStatus();
 loadRecent();
 
 const landing = $("landing"), appScreen = $("app-screen");
