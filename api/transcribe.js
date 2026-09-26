@@ -9,8 +9,9 @@ export default async function handler(request, response) {
     const audio = Buffer.from(audioBase64, "base64");
     if (!audio.length || audio.length > 4_000_000) return response.status(400).json({ error: "Audio is empty or too large for the demo." });
 
+    const contentType = typeof mimeType === "string" ? mimeType.split(";", 1)[0].trim().toLowerCase() : "audio/webm";
     const form = new FormData();
-    form.append("file", new Blob([audio], { type: mimeType }), "capture.webm");
+    form.append("file", new Blob([audio], { type: contentType }), "capture.webm");
     form.append("model", "saaras:v3");
     const result = await fetch("https://api.sarvam.ai/speech-to-text", {
       method: "POST",

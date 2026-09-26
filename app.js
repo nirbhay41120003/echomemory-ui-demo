@@ -104,10 +104,12 @@ async function processRecording() {
   recorder = null; audioChunks = [];
   try {
     const audioBase64 = await blobToBase64(blob);
-    const transcriptResponse = await fetch("/api/transcribe", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ audioBase64, mimeType: blob.type }) });
+    const mimeType = blob.type.split(";", 1)[0] || "audio/webm";
+    const transcriptResponse = await fetch("/api/transcribe", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ audioBase64, mimeType }) });
     const transcriptData = await transcriptResponse.json();
     if (!transcriptResponse.ok) throw new Error(transcriptData.error || "Sarvam transcription failed.");
     if (!transcriptData.transcript) throw new Error("Sarvam did not detect any speech.");
+    finalized = [transcriptData.transcript]; partial = ""; renderTranscript();
     setStatus("Polishing with Groq…", "busy");
     const cleanupResponse = await fetch("/api/cleanup", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: transcriptData.transcript }) });
     const cleanupData = await cleanupResponse.json();
@@ -115,7 +117,8 @@ async function processRecording() {
     finalized = [cleanupData.text]; partial = ""; renderTranscript(); addDemoMemory(cleanupData.text);
     setStatus("Saved with Groq", ""); setTranscriptMode("Saved", "");
   } catch (error) {
-    captureSaveFailed = true; setStatus(error.message || "Cloud capture failed.", "warn"); setTranscriptMode("Not saved", "warn");
+    captureSaveFailed = true; setStatus(error.message || "Cloud capture failed.", "warn");
+    setTranscriptMode(finalized.length ? "Transcribed" : "Not saved", "warn");
   }
 }
 
