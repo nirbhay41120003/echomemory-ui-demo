@@ -2,6 +2,7 @@ let stream, recorder, audioChunks = [], timerInterval, isCapturing = false, isSt
 let realtimeSocket, realtimeReady = false, realtimeFailed = false, realtimeSessionEnded = false, resolveRealtimeEnd;
 let audioContext, audioProcessor;
 let finalized = [], partial = "";
+let pendingMemory = "";
 const MEMORY_KEY = "echomemory-demo-memories";
 let demoMemories = loadStoredMemories();
 const $ = (id) => document.getElementById(id);
@@ -38,6 +39,20 @@ function setTranscriptMode(text, state = "") {
   const mode = $("transcript-mode");
   mode.textContent = text;
   mode.className = `transcript-mode ${state}`;
+}
+
+async function cleanAndSaveMemory(rawText) {
+  const response = await fetch("/api/cleanup", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text: rawText }),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || "Groq cleanup failed. Nothing was saved.");
+  const cleaned = typeof data.text === "string" ? data.text.trim() : "";
+  if (!cleaned || cleaned.length > 10_000) throw new Error("Groq returned no usable cleaned memory. Nothing was saved.");
+  if (!persistMemory(cleaned)) throw new Error("Memory storage is full. The cleaned text is ready to retry.");
+  return cleaned;
 }
 
 function downsample(input, inputRate, outputRate = 16000) {
@@ -235,7 +250,6 @@ function blobToBase64(blob) {
 async function processRecording() {
   const blob = new Blob(audioChunks, { type: recorder?.mimeType || "audio/webm" });
   recorder = null; audioChunks = [];
-  let cleanupAttempted = false;
   try {
     if (realtimeReady && !realtimeFailed) {
       const ended = await new Promise((resolve) => {
@@ -261,23 +275,21 @@ async function processRecording() {
     if (!transcript) throw new Error("Sarvam did not detect any speech.");
     renderTranscript();
     setStatus("Polishing with Groq…", "busy");
-    cleanupAttempted = true;
-    const cleanupResponse = await fetch("/api/cleanup", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: transcript }) });
-    const cleanupData = await cleanupResponse.json().catch(() => ({}));
-    if (!cleanupResponse.ok) throw new Error(cleanupData.error || "Groq cleanup failed.");
-    finalized = [cleanupData.text]; partial = ""; renderTranscript();
-    if (!addDemoMemory(cleanupData.text)) throw new Error("Memory could not be saved in this browser. Copy the transcript before closing this page.");
+    const cleaned = await cleanAndSaveMemory(transcript);
+    pendingMemory = "";
+    $("retry-cleanup").hidden = true;
+    finalized = [cleaned]; partial = ""; renderTranscript();
     setStatus("Saved on this device", ""); setTranscriptMode("Saved", "");
   } catch (error) {
-    if (finalized.length && addDemoMemory(finalized.join(" "))) {
-      setStatus("Transcript saved on this device", "warn");
-      setTranscriptMode(cleanupAttempted ? "Saved · cleanup unavailable" : "Saved · connection interrupted", "warn");
-      $("hint").textContent = cleanupAttempted
-        ? "The transcript was saved as-is because Groq cleanup failed."
-        : "Recognized words were saved, but the Sarvam connection ended before the full capture completed.";
+    if (finalized.length && finalized.join(" ").trim()) {
+      pendingMemory = finalized.join(" ").trim();
+      $("retry-cleanup").hidden = false;
+      setStatus("Not saved · cleanup needed", "warn");
+      setTranscriptMode("Not saved · retry cleanup", "warn");
+      $("hint").textContent = `${error.message || "Cleanup failed."} Your transcript is still shown here. Retry cleanup to save it.`;
     } else {
       setStatus(error.message || "Cloud transcription failed.", "warn");
-      setTranscriptMode(finalized.length ? "Not saved" : "Not transcribed", "warn");
+      setTranscriptMode("Not transcribed", "warn");
     }
   } finally {
     isProcessing = false;
@@ -301,7 +313,7 @@ function formatTime(value) {
   return Number.isNaN(date.getTime()) ? "Saved earlier" : new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(date);
 }
 
-function addDemoMemory(text) {
+function persistMemory(text) {
   const memory = { text, created_at: new Date().toISOString() };
   demoMemories.unshift(memory);
   try { localStorage.setItem(MEMORY_KEY, JSON.stringify(demoMemories)); }
@@ -337,10 +349,37 @@ $("chat-form").addEventListener("submit", (event) => {
 });
 $("save-note").addEventListener("click", async () => {
   const input = $("note-text"), text = input.value.trim(); if (!text) return;
-  const button = $("save-note"); button.disabled = true; button.textContent = "Saving…";
-  if (addDemoMemory(text)) { input.value = ""; button.textContent = "Saved on this device"; }
-  else button.textContent = "Storage is full";
-  setTimeout(() => { button.disabled = false; button.textContent = "Save locally"; }, 1800);
+  const button = $("save-note"), status = $("note-status");
+  button.disabled = true; button.textContent = "Cleaning with Groq…"; status.textContent = "";
+  try {
+    await cleanAndSaveMemory(text);
+    input.value = ""; status.textContent = "Cleaned and saved on this device.";
+  } catch (error) {
+    status.textContent = `${error.message || "Cleanup failed."} Nothing was saved; retry when ready.`;
+  } finally {
+    button.disabled = false; button.textContent = "Clean & save";
+  }
+});
+
+$("retry-cleanup").addEventListener("click", async () => {
+  if (!pendingMemory || isCapturing || isProcessing) return;
+  const button = $("retry-cleanup"), retryText = pendingMemory;
+  button.disabled = true; button.textContent = "Cleaning with Groq…";
+  setStatus("Retrying cleanup…", "busy");
+  try {
+    const cleaned = await cleanAndSaveMemory(retryText);
+    if (pendingMemory === retryText) {
+      pendingMemory = ""; button.hidden = true;
+      finalized = [cleaned]; partial = ""; renderTranscript();
+    }
+    setStatus("Saved on this device", ""); setTranscriptMode("Saved", "");
+    $("hint").textContent = "Groq cleaned the memory before it was saved on this device.";
+  } catch (error) {
+    setStatus("Not saved · cleanup needed", "warn"); setTranscriptMode("Not saved · retry cleanup", "warn");
+    $("hint").textContent = `${error.message || "Cleanup failed."} Nothing was saved. Retry when ready.`;
+  } finally {
+    button.disabled = false; button.textContent = "Retry cleanup & save";
+  }
 });
 
 async function loadStatus() {

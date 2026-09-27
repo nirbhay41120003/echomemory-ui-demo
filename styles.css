@@ -11,3 +11,4 @@
 .app-brand .brand-symbol,.landing-brand .brand-symbol{position:relative;display:inline-block;width:24px;height:24px;flex:0 0 24px;font-size:0;color:#2b4eff;border:1.5px solid currentColor;border-radius:50%;line-height:1}
 .app-brand .brand-symbol::after,.landing-brand .brand-symbol::after{content:"";position:absolute;left:50%;top:50%;width:5px;height:5px;background:currentColor;border-radius:50%;transform:translate(-50%,-50%)}
 @media(max-width:760px){.app-brand .brand-symbol,.landing-brand .brand-symbol{width:23px;height:23px;flex-basis:23px}}
+.note-status{max-width:260px;color:#8b877a;font-size:10px;line-height:1.5}

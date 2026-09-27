@@ -19,7 +19,7 @@ export function requireEnv(response, name) {
   return true;
 }
 
-export async function groqRequest(messages, maxCompletionTokens = 700) {
+export async function groqRequest(messages, maxCompletionTokens = 700, responseFormat) {
   const result = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -34,6 +34,7 @@ export async function groqRequest(messages, maxCompletionTokens = 700) {
       temperature: 0.1,
       reasoning_effort: "low",
       include_reasoning: false,
+      ...(responseFormat ? { response_format: responseFormat } : {}),
     }),
   });
   const payload = await result.json().catch(() => ({}));
