@@ -11,8 +11,10 @@ export default async function handler(request, response) {
 
     const contentType = typeof mimeType === "string" ? mimeType.split(";", 1)[0].trim().toLowerCase() : "audio/webm";
     const form = new FormData();
-    form.append("file", new Blob([audio], { type: contentType }), "capture.webm");
+    const extension = contentType === "audio/wav" || contentType === "audio/x-wav" ? "wav" : "webm";
+    form.append("file", new Blob([audio], { type: contentType }), `capture.${extension}`);
     form.append("model", "saaras:v3");
+    form.append("language_code", "unknown");
     const result = await fetch("https://api.sarvam.ai/speech-to-text", {
       method: "POST",
       headers: { "api-subscription-key": process.env.SARVAM_API_KEY },

@@ -1,9 +1,17 @@
-let stream, recorder, audioChunks = [], timerInterval, modelPoll, isCapturing = false;
-let activeAsr = "sarvam_ai";
-let activeLlm = "groq_gpt_oss_20b";
-let finalized = [], partial = "", captureSaveFailed = false;
-const demoMemories = JSON.parse(localStorage.getItem("echomemory-demo-memories") || "[]");
+let stream, recorder, audioChunks = [], timerInterval, isCapturing = false, isStarting = false, isProcessing = false;
+let realtimeSocket, realtimeReady = false, realtimeFailed = false, realtimeSessionEnded = false, resolveRealtimeEnd;
+let audioContext, audioProcessor;
+let finalized = [], partial = "";
+const MEMORY_KEY = "echomemory-demo-memories";
+let demoMemories = loadStoredMemories();
 const $ = (id) => document.getElementById(id);
+
+function loadStoredMemories() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(MEMORY_KEY) || "[]");
+    return Array.isArray(saved) ? saved.filter((item) => item && typeof item.text === "string") : [];
+  } catch (_) { return []; }
+}
 
 function setStatus(text, state = "") {
   $("status").querySelector("span").textContent = text;
@@ -33,13 +41,11 @@ function setTranscriptMode(text, state = "") {
 }
 
 function downsample(input, inputRate, outputRate = 16000) {
-  if (inputRate === outputRate) return input.slice();
+  if (inputRate === outputRate) return input;
   const ratio = inputRate / outputRate;
-  const length = Math.round(input.length / ratio);
-  const output = new Float32Array(length);
-  for (let index = 0; index < length; index += 1) {
-    const start = Math.floor(index * ratio);
-    const end = Math.min(Math.floor((index + 1) * ratio), input.length);
+  const output = new Float32Array(Math.floor(input.length / ratio));
+  for (let index = 0; index < output.length; index += 1) {
+    const start = Math.floor(index * ratio), end = Math.min(Math.floor((index + 1) * ratio), input.length);
     let sum = 0;
     for (let sample = start; sample < end; sample += 1) sum += input[sample];
     output[index] = sum / Math.max(1, end - start);
@@ -47,10 +53,30 @@ function downsample(input, inputRate, outputRate = 16000) {
   return output;
 }
 
-function rootMeanSquare(samples) {
-  let total = 0;
-  for (let index = 0; index < samples.length; index += 1) total += samples[index] * samples[index];
-  return Math.sqrt(total / samples.length);
+async function recordingToWav(blob) {
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextClass) throw new Error("This browser cannot convert the recording for transcription.");
+  const context = new AudioContextClass();
+  try {
+    const decoded = await context.decodeAudioData(await blob.arrayBuffer());
+    const mono = new Float32Array(decoded.length);
+    for (let channel = 0; channel < decoded.numberOfChannels; channel += 1) {
+      const samples = decoded.getChannelData(channel);
+      for (let index = 0; index < samples.length; index += 1) mono[index] += samples[index] / decoded.numberOfChannels;
+    }
+    const samples = downsample(mono, decoded.sampleRate);
+    const wav = new ArrayBuffer(44 + samples.length * 2), view = new DataView(wav);
+    const write = (offset, value) => { for (let i = 0; i < value.length; i += 1) view.setUint8(offset + i, value.charCodeAt(i)); };
+    write(0, "RIFF"); view.setUint32(4, 36 + samples.length * 2, true); write(8, "WAVE"); write(12, "fmt ");
+    view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+    view.setUint32(24, 16000, true); view.setUint32(28, 32000, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+    write(36, "data"); view.setUint32(40, samples.length * 2, true);
+    for (let index = 0; index < samples.length; index += 1) {
+      const sample = Math.max(-1, Math.min(1, samples[index]));
+      view.setInt16(44 + index * 2, sample < 0 ? sample * 32768 : sample * 32767, true);
+    }
+    return new Blob([wav], { type: "audio/wav" });
+  } finally { await context.close(); }
 }
 
 function stopAudio() {
@@ -62,31 +88,138 @@ function startTimer() {
   const started = Date.now();
   $("timer").textContent = "00:00";
   timerInterval = setInterval(() => {
-    $("timer").textContent = new Date(Date.now() - started).toISOString().slice(14, 19);
+    const elapsed = Math.floor((Date.now() - started) / 1000);
+    $("timer").textContent = `${String(Math.floor(elapsed / 60)).padStart(2, "0")}:${String(elapsed % 60).padStart(2, "0")}`;
+    if (elapsed >= 25) {
+      $("hint").textContent = "25-second limit reached. Transcribing your capture now…";
+      finishCapture();
+    }
   }, 1000);
 }
 
-async function startCapture() {
+function connectRealtime() {
+  return new Promise((resolve) => {
+    const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+    let socket;
+    try { socket = new WebSocket(`${protocol}//${location.host}/api/realtime`); }
+    catch (_) { realtimeFailed = true; resolve(false); return; }
+    realtimeSocket = socket;
+    let settled = false;
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true; realtimeFailed = true; socket.close(); resolve(false);
+    }, 10000);
+    socket.addEventListener("message", (message) => {
+      let event;
+      try { event = JSON.parse(message.data); } catch (_) { return; }
+      if (event.event === "ready") {
+        realtimeReady = true; settled = true; clearTimeout(timeout); resolve(true); return;
+      }
+      if (event.event === "transcript.partial") {
+        partial = event.text || ""; renderTranscript(); setTranscriptMode("Live · Sarvam", "live");
+      } else if (event.event === "transcript.final") {
+        if (event.text?.trim()) finalized.push(event.text.trim());
+        partial = ""; renderTranscript(); setTranscriptMode("Live · Sarvam", "live");
+      } else if (event.event === "session.end") {
+        realtimeSessionEnded = true; resolveRealtimeEnd?.(true);
+      } else if (event.event === "error") {
+        realtimeFailed = true;
+        $("hint").textContent = event.message || "Sarvam live transcription stopped. The saved audio will be sent after capture.";
+        if (!settled) { settled = true; clearTimeout(timeout); resolve(false); }
+        if (event.is_fatal) resolveRealtimeEnd?.(false);
+      }
+    });
+    socket.addEventListener("error", () => {
+      realtimeFailed = true;
+      if (!settled) { settled = true; clearTimeout(timeout); resolve(false); }
+    });
+    socket.addEventListener("close", () => {
+      realtimeReady = false;
+      if (!realtimeSessionEnded) realtimeFailed = true;
+      if (!settled) { settled = true; clearTimeout(timeout); resolve(false); }
+      resolveRealtimeEnd?.(realtimeSessionEnded);
+    });
+  });
+}
+
+async function startRealtimeAudio(audioStream) {
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextClass || !realtimeReady) { realtimeFailed = true; return false; }
   try {
+    audioContext ||= new AudioContextClass();
+    if (audioContext.state === "suspended") await audioContext.resume();
+    const source = audioContext.createMediaStreamSource(audioStream);
+    audioProcessor = audioContext.createScriptProcessor(4096, 1, 1);
+    const mute = audioContext.createGain(); mute.gain.value = 0;
+    audioProcessor.onaudioprocess = (event) => {
+      if (!realtimeReady || realtimeFailed || realtimeSocket?.readyState !== WebSocket.OPEN) return;
+      const pcm = downsample(event.inputBuffer.getChannelData(0), audioContext.sampleRate);
+      const bytes = new ArrayBuffer(pcm.length * 2), view = new DataView(bytes);
+      for (let index = 0; index < pcm.length; index += 1) {
+        const sample = Math.max(-1, Math.min(1, pcm[index]));
+        view.setInt16(index * 2, sample < 0 ? sample * 32768 : sample * 32767, true);
+      }
+      try { realtimeSocket.send(bytes); } catch (_) { realtimeFailed = true; }
+    };
+    source.connect(audioProcessor); audioProcessor.connect(mute); mute.connect(audioContext.destination);
+    return true;
+  } catch (_) { realtimeFailed = true; stopRealtimeAudio(); return false; }
+}
+
+function stopRealtimeAudio() {
+  if (audioProcessor) { audioProcessor.onaudioprocess = null; audioProcessor.disconnect(); audioProcessor = null; }
+  if (audioContext) { audioContext.close().catch(() => {}); audioContext = null; }
+}
+
+function stopRealtime() {
+  stopRealtimeAudio();
+  if (realtimeSocket?.readyState === WebSocket.OPEN && !realtimeFailed) {
+    realtimeSocket.send(JSON.stringify({ event: "end" }));
+  } else {
+    resolveRealtimeEnd?.(false);
+    realtimeSocket?.close();
+  }
+}
+
+async function startCapture() {
+  if (isStarting || isCapturing || isProcessing) return;
+  isStarting = true; $("capture").disabled = true;
+  try {
+    if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) throw new Error("Audio capture needs a supported browser and a secure connection (HTTPS).");
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (AudioContextClass) {
+      try { audioContext = new AudioContextClass(); audioContext.resume().catch(() => {}); } catch (_) { audioContext = null; }
+    }
     stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus" : "audio/webm";
-    recorder = new MediaRecorder(stream, { mimeType });
+    finalized = []; partial = ""; realtimeFailed = false; realtimeReady = false; realtimeSessionEnded = false; resolveRealtimeEnd = null;
+    const mimeType = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"].find((type) => MediaRecorder.isTypeSupported(type));
+    recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
     audioChunks = [];
     recorder.addEventListener("dataavailable", (event) => { if (event.data.size) audioChunks.push(event.data); });
     recorder.addEventListener("stop", processRecording, { once: true });
+    setStatus("Connecting to Sarvam…", "busy"); setTranscriptMode("Connecting", "busy");
+    $("hint").textContent = "Opening a secure live transcription connection to Sarvam AI…";
+    const connected = await connectRealtime();
     recorder.start();
-    finalized = []; partial = ""; captureSaveFailed = false;
-    renderTranscript(); startTimer(); setCaptureButton(true); setStatus("Listening with Sarvam", "live"); setTranscriptMode("Listening", "live");
-    $("hint").textContent = "Sarvam AI will transcribe this capture, then Groq will polish it.";
+    isStarting = false; $("capture").disabled = false;
+    renderTranscript(); startTimer(); setCaptureButton(true); setStatus(connected ? "Listening · Sarvam realtime" : "Recording · Sarvam fallback", connected ? "live" : "warn");
+    setTranscriptMode(connected ? "Sarvam live" : "Sarvam fallback", connected ? "live" : "warn");
+    const streaming = connected && await startRealtimeAudio(stream);
+    if (!streaming) realtimeFailed = true;
+    $("hint").textContent = streaming
+      ? "Live audio streams securely to Sarvam AI. Capture is capped at 25 seconds."
+      : "Sarvam realtime is unavailable. The recording will be uploaded for transcription when you stop.";
   } catch (error) {
-    stopAudio(); setStatus("Microphone unavailable", "warn"); $("hint").textContent = error.message || "Microphone permission is required.";
+    isStarting = false; $("capture").disabled = false;
+    stopRealtimeAudio(); realtimeSocket?.close(); stopAudio(); setCaptureButton(false); setStatus("Microphone unavailable", "warn"); $("hint").textContent = error.message || "Microphone permission is required.";
   }
 }
 
 function finishCapture() {
-  setCaptureButton(false); stopAudio();
+  setCaptureButton(false); stopRealtime(); stopAudio();
   if (recorder && recorder.state !== "inactive") {
-    setStatus("Transcribing with Sarvam…", "busy"); setTranscriptMode("Processing", "busy"); recorder.stop();
+    isProcessing = true; $("capture").disabled = true;
+    setStatus(realtimeFailed ? "Sending capture to Sarvam…" : "Finalizing Sarvam transcript…", "busy"); setTranscriptMode("Processing", "busy"); recorder.stop();
   }
 }
 
@@ -102,43 +235,78 @@ function blobToBase64(blob) {
 async function processRecording() {
   const blob = new Blob(audioChunks, { type: recorder?.mimeType || "audio/webm" });
   recorder = null; audioChunks = [];
+  let cleanupAttempted = false;
   try {
-    const audioBase64 = await blobToBase64(blob);
-    const mimeType = blob.type.split(";", 1)[0] || "audio/webm";
-    const transcriptResponse = await fetch("/api/transcribe", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ audioBase64, mimeType }) });
-    const transcriptData = await transcriptResponse.json();
-    if (!transcriptResponse.ok) throw new Error(transcriptData.error || "Sarvam transcription failed.");
-    if (!transcriptData.transcript) throw new Error("Sarvam did not detect any speech.");
-    finalized = [transcriptData.transcript]; partial = ""; renderTranscript();
+    if (realtimeReady && !realtimeFailed) {
+      const ended = await new Promise((resolve) => {
+        let timeout;
+        const complete = (value) => { clearTimeout(timeout); resolveRealtimeEnd = null; resolve(value); };
+        resolveRealtimeEnd = complete;
+        if (realtimeSessionEnded) complete(true);
+        else timeout = setTimeout(() => { realtimeFailed = true; complete(false); realtimeSocket?.close(); }, 7000);
+      });
+      if (!ended) realtimeFailed = true;
+    }
+    if (realtimeFailed || !finalized.length) {
+      const wav = await recordingToWav(blob);
+      const audioBase64 = await blobToBase64(wav);
+      const transcriptResponse = await fetch("/api/transcribe", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ audioBase64, mimeType: "audio/wav" }) });
+      const transcriptData = await transcriptResponse.json().catch(() => ({}));
+      if (!transcriptResponse.ok) throw new Error(transcriptData.error || "Sarvam transcription failed.");
+      if (!transcriptData.transcript) throw new Error("Sarvam did not detect any speech.");
+      finalized = [transcriptData.transcript]; partial = ""; renderTranscript();
+    }
+    partial = "";
+    const transcript = finalized.join(" ").trim();
+    if (!transcript) throw new Error("Sarvam did not detect any speech.");
+    renderTranscript();
     setStatus("Polishing with Groq…", "busy");
-    const cleanupResponse = await fetch("/api/cleanup", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: transcriptData.transcript }) });
-    const cleanupData = await cleanupResponse.json();
+    cleanupAttempted = true;
+    const cleanupResponse = await fetch("/api/cleanup", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: transcript }) });
+    const cleanupData = await cleanupResponse.json().catch(() => ({}));
     if (!cleanupResponse.ok) throw new Error(cleanupData.error || "Groq cleanup failed.");
-    finalized = [cleanupData.text]; partial = ""; renderTranscript(); addDemoMemory(cleanupData.text);
-    setStatus("Saved with Groq", ""); setTranscriptMode("Saved", "");
+    finalized = [cleanupData.text]; partial = ""; renderTranscript();
+    if (!addDemoMemory(cleanupData.text)) throw new Error("Memory could not be saved in this browser. Copy the transcript before closing this page.");
+    setStatus("Saved on this device", ""); setTranscriptMode("Saved", "");
   } catch (error) {
-    captureSaveFailed = true; setStatus(error.message || "Cloud capture failed.", "warn");
-    setTranscriptMode(finalized.length ? "Transcribed" : "Not saved", "warn");
+    if (finalized.length && addDemoMemory(finalized.join(" "))) {
+      setStatus("Transcript saved on this device", "warn");
+      setTranscriptMode(cleanupAttempted ? "Saved · cleanup unavailable" : "Saved · connection interrupted", "warn");
+      $("hint").textContent = cleanupAttempted
+        ? "The transcript was saved as-is because Groq cleanup failed."
+        : "Recognized words were saved, but the Sarvam connection ended before the full capture completed.";
+    } else {
+      setStatus(error.message || "Cloud transcription failed.", "warn");
+      setTranscriptMode(finalized.length ? "Not saved" : "Not transcribed", "warn");
+    }
+  } finally {
+    isProcessing = false;
+    $("capture").disabled = false;
   }
 }
 
 async function loadSummary() {
   const button = $("refresh-summary");
   button.disabled = true; button.textContent = "Refreshing…";
-  $("summary-text").textContent = demoMemories.length
-    ? `You have ${demoMemories.length} saved demo memor${demoMemories.length === 1 ? "y" : "ies"}.`
-    : "This UI preview keeps memories only in this browser.";
-  button.disabled = false; button.textContent = "Refresh summary ↗";
+  const today = new Date().toLocaleDateString();
+  const todaysMemories = demoMemories.filter((memory) => new Date(memory.created_at).toLocaleDateString() === today);
+  $("summary-text").textContent = todaysMemories.length
+    ? todaysMemories.map((memory) => `• ${memory.text}`).join("\n")
+    : "No memories saved today. Add a voice or written memory and it will appear here.";
+  button.disabled = false; button.textContent = "Refresh list ↗";
 }
 
 function formatTime(value) {
-  return new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(new Date(value));
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "Saved earlier" : new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(date);
 }
 
 function addDemoMemory(text) {
-  demoMemories.unshift({ text, created_at: new Date().toISOString() });
-  localStorage.setItem("echomemory-demo-memories", JSON.stringify(demoMemories));
-  loadRecent();
+  const memory = { text, created_at: new Date().toISOString() };
+  demoMemories.unshift(memory);
+  try { localStorage.setItem(MEMORY_KEY, JSON.stringify(demoMemories)); }
+  catch (_) { demoMemories.shift(); return false; }
+  loadRecent(); return true;
 }
 
 function loadRecent() {
@@ -146,7 +314,7 @@ function loadRecent() {
   $("memory-count").textContent = demoMemories.length ? `${demoMemories.length} saved` : "";
   list.replaceChildren();
   if (!demoMemories.length) { list.textContent = "Your saved memories will appear here."; return; }
-  demoMemories.slice(0, 9).forEach((memory) => {
+  demoMemories.slice(0, 40).forEach((memory) => {
     const item = document.createElement("article"); item.className = "memory";
     const time = document.createElement("time"); time.textContent = formatTime(memory.created_at);
     const text = document.createElement("div"); text.textContent = memory.text;
@@ -154,140 +322,30 @@ function loadRecent() {
   });
 }
 
-function formatBytes(bytes) {
-  if (!bytes) return "Preparing…";
-  const units = ["B", "KB", "MB", "GB"], power = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
-  return `${(bytes / 1024 ** power).toFixed(power ? 1 : 0)} ${units[power]}`;
-}
-
-async function beginModelDownload(model) {
-  try {
-    const response = await fetch("/api/models/download", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model }) });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.detail || "Download could not start.");
-    await loadModels();
-  } catch (error) {
-    const target = model.startsWith("llm_") ? $("llm-list") : $("model-list");
-    target.querySelector(`[data-model-error="${model}"]`)?.remove();
-    const message = document.createElement("p"); message.className = "model-error"; message.dataset.modelError = model; message.textContent = error.message || "Download could not start."; target.prepend(message);
-  }
-}
-
-async function activateModel(selected) {
-  try {
-    const response = await fetch("/api/models/select", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: selected }) });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.detail || "This model runtime is not available.");
-    activeAsr = data.active_asr;
-    $("hint").textContent = selected === "asr_sarvam_ai" ? "Sarvam AI is ready for speech-to-text." : "Your selected local speech model is ready.";
-    await Promise.all([loadStatus(), loadModels()]);
-  } catch (error) { $("hint").textContent = error.message; setStatus("Model unavailable", "warn"); }
-}
-
-async function saveSarvamKey(event) {
-  event.preventDefault();
-  const input = $("sarvam-key"), button = event.currentTarget.querySelector("button"), key = input.value.trim();
-  if (!key) return;
-  button.disabled = true; button.textContent = "Demo configured";
-  $("sarvam-key-status").textContent = "This demo uses the deployment's server-side Sarvam key. User keys are not accepted in the browser.";
-  input.value = ""; setStatus("Cloud demo", "live");
-  setTimeout(() => { button.disabled = false; button.textContent = "Save & use Sarvam"; }, 1200);
-}
-
-async function activateLlm(selected) {
-  try {
-    const response = await fetch("/api/models/select", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: selected }) });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.detail || "This chat model could not be loaded.");
-    activeLlm = data.active_llm;
-    $("answer").textContent = "Groq chat is ready. Ask about your memories.";
-    await Promise.all([loadStatus(), loadModels()]);
-  } catch (error) {
-    const message = document.createElement("p"); message.className = "model-error"; message.textContent = error.message || "This chat model could not be loaded.";
-    $("llm-list").prepend(message); setStatus("Chat model unavailable", "warn");
-  }
-}
-
-function modelButton(label, action, disabled = false) {
-  const button = document.createElement("button"); button.className = "model-action"; button.type = "button"; button.textContent = label; button.disabled = disabled;
-  button.addEventListener("click", action); return button;
-}
-
-async function loadModels() {
-  try {
-    const data = await fetch("/api/models").then((response) => response.json());
-    const list = $("model-list"); list.replaceChildren();
-    data.models.filter((model) => model.id.startsWith("asr_") && model.runtime !== "sarvam-api").forEach((model) => {
-      const card = document.createElement("article"); card.className = `model${model.runtime === "sarvam-api" ? " sarvam-model" : ""}`;
-      if (model.id === activeAsr) card.classList.add("active");
-      const runtimeBlocked = model.status === "ready" && model.runtime !== "faster-whisper" && model.runtime !== "sarvam-api" && !model.runtime_ready;
-      const top = document.createElement("div"); top.className = "model-top";
-      const heading = document.createElement("div"); const title = document.createElement("h3"); title.textContent = model.label; const description = document.createElement("p"); description.textContent = `${model.description} ${model.size}`; heading.append(title, description);
-      const status = document.createElement("span"); status.className = "model-status"; status.textContent = model.id === activeAsr ? "In use" : runtimeBlocked ? "Runtime needed" : model.runtime === "sarvam-api" && !model.configured ? "API key needed" : model.runtime === "sarvam-api" ? "Ready to use" : model.status === "ready" ? "Ready locally" : model.status.replace("_", " "); top.append(heading, status); card.append(top);
-      if (model.status === "downloading" || model.status === "queued") {
-        const progress = document.createElement("div"); progress.className = "model-progress"; const fill = document.createElement("i"); fill.style.width = model.total ? `${Math.min(100, model.received / model.total * 100)}%` : "8%"; progress.append(fill);
-        const detail = document.createElement("div"); detail.className = "model-detail"; const file = document.createElement("span"); file.textContent = model.file || "Waiting…"; const bytes = document.createElement("span"); bytes.textContent = model.total ? `${formatBytes(model.received)} / ${formatBytes(model.total)}` : formatBytes(model.received); detail.append(file, bytes); card.append(progress, detail);
-      } else if (model.status === "error" && !String(model.error || "").includes("disabled on Python 3.14")) { const error = document.createElement("p"); error.className = "model-error"; error.textContent = model.error; card.append(error); }
-      if (model.runtime === "sarvam-api" && !model.configured) {
-        const note = document.createElement("p"); note.className = "model-note"; note.textContent = "Save an API key above to enable this model."; card.append(note);
-      } else if (model.runtime !== "faster-whisper") {
-        const runtime = document.createElement("p"); runtime.className = "model-note";
-        runtime.textContent = model.runtime_message || (model.runtime === "funasr-gguf" ? "Needs llama-funasr-cli from llama.cpp." : "Needs NVIDIA NeMo-Speech.cpp (nemo-speech).");
-        card.append(runtime);
-      }
-      if (model.status === "ready" && !runtimeBlocked) card.append(modelButton(model.id === activeAsr ? "Currently using" : "Use this model", () => activateModel(model.id), model.id === activeAsr || data.running));
-      else if (model.downloadable !== false) card.append(modelButton("Download model", () => beginModelDownload(model.id), data.running));
-      else if (model.runtime !== "sarvam-api") { const setup = document.createElement("p"); setup.className = "model-note"; setup.textContent = "Place a converted .gguf file in this model folder to enable it."; card.append(setup); }
-      list.append(card);
-    });
-    const llmList = $("llm-list"); llmList.replaceChildren();
-    data.models.filter((model) => model.id.startsWith("llm_")).forEach((model) => {
-      const card = document.createElement("article"); card.className = "model";
-      if (model.id === activeLlm) card.classList.add("active");
-      const top = document.createElement("div"); top.className = "model-top";
-      const heading = document.createElement("div"); const title = document.createElement("h3"); title.textContent = model.label; const description = document.createElement("p"); description.textContent = `${model.description} ${model.size}`; heading.append(title, description);
-      const runtimeBlocked = model.runtime_ready === false;
-      const status = document.createElement("span"); status.className = "model-status"; status.textContent = model.id === activeLlm ? "In use" : runtimeBlocked ? "Runtime needed" : model.status === "ready" ? "Ready locally" : model.status.replace("_", " "); top.append(heading, status); card.append(top);
-      if (model.status === "downloading" || model.status === "queued") {
-        const progress = document.createElement("div"); progress.className = "model-progress"; const fill = document.createElement("i"); fill.style.width = model.total ? `${Math.min(100, model.received / model.total * 100)}%` : "8%"; progress.append(fill); card.append(progress);
-        const detail = document.createElement("div"); detail.className = "model-detail"; detail.textContent = model.file || "Preparing download…"; card.append(detail);
-      } else if (model.status === "error") { const error = document.createElement("p"); error.className = "model-error"; error.textContent = model.error; card.append(error); }
-      if (runtimeBlocked) { const runtime = document.createElement("p"); runtime.className = "model-note"; runtime.textContent = "Runtime will be checked when you select this model. Extractive answers remain available as a fallback."; card.append(runtime); }
-      const downloadedChat = model.runtime === "llama-cpp" && (model.downloaded || model.status === "error");
-      if (model.status === "ready" || downloadedChat) card.append(modelButton(model.id === activeLlm ? "Currently using" : "Use this model", () => activateLlm(model.id), model.id === activeLlm || data.running));
-      else if (!runtimeBlocked && model.status !== "ready") card.append(modelButton("Download model", () => beginModelDownload(model.id), data.running));
-      llmList.append(card);
-    });
-    if (data.running && !modelPoll) modelPoll = setInterval(loadModels, 600);
-    if (!data.running && modelPoll) { clearInterval(modelPoll); modelPoll = null; loadStatus(); }
-  } catch (_) { $("model-list").textContent = "Model setup is unavailable while the local server is offline."; }
-}
-
 $("capture").addEventListener("click", () => isCapturing ? finishCapture() : startCapture());
 $("refresh-summary").addEventListener("click", loadSummary);
 $("chat-form").addEventListener("submit", (event) => {
   event.preventDefault(); const question = $("question").value.trim(); if (!question) return;
+  const button = event.currentTarget.querySelector("button");
+  button.disabled = true;
   $("answer").textContent = "Asking Groq…"; $("sources").replaceChildren();
   fetch("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ question, memories: demoMemories }) })
-    .then(async (response) => { const data = await response.json(); if (!response.ok) throw new Error(data.error || "Groq chat failed."); return data; })
-    .then((data) => { $("answer").textContent = data.answer; data.sources.forEach((source) => { const chip = document.createElement("span"); chip.className = "source"; chip.textContent = `${formatTime(source.created_at)} · ${source.text}`; $("sources").append(chip); }); })
-    .catch((error) => { $("answer").textContent = error.message || "Groq chat failed."; });
+    .then(async (response) => { const data = await response.json().catch(() => ({})); if (!response.ok) throw new Error(data.error || "Groq chat failed."); return data; })
+    .then((data) => { $("answer").textContent = data.answer; (data.sources || []).forEach((source) => { const chip = document.createElement("span"); chip.className = "source"; chip.textContent = `${formatTime(source.created_at)} · ${source.text}`; $("sources").append(chip); }); })
+    .catch((error) => { $("answer").textContent = error.message || "Groq chat failed."; })
+    .finally(() => { button.disabled = false; });
 });
 $("save-note").addEventListener("click", async () => {
   const input = $("note-text"), text = input.value.trim(); if (!text) return;
-  $("save-note").textContent = "Polishing with Groq…";
-  try {
-    const response = await fetch("/api/cleanup", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text }) });
-    const data = await response.json(); if (!response.ok) throw new Error(data.error || "Groq cleanup failed.");
-    addDemoMemory(data.text); input.value = ""; $("save-note").textContent = "Saved with Groq";
-  } catch (error) { $("save-note").textContent = error.message || "Could not save"; }
-  setTimeout(() => { $("save-note").textContent = "Save locally"; }, 1600);
+  const button = $("save-note"); button.disabled = true; button.textContent = "Saving…";
+  if (addDemoMemory(text)) { input.value = ""; button.textContent = "Saved on this device"; }
+  else button.textContent = "Storage is full";
+  setTimeout(() => { button.disabled = false; button.textContent = "Save locally"; }, 1800);
 });
 
 async function loadStatus() {
   try {
     const data = await fetch("/api/status").then((response) => response.json());
-    activeAsr = data.active_asr || "sarvam_ai"; activeLlm = data.active_llm || "groq_gpt_oss_20b";
     const configured = data.configured ?? (data.sarvam_configured && data.groq_configured);
     const missing = Array.isArray(data.missing) ? data.missing : [
       ...(!data.sarvam_configured ? ["SARVAM_API_KEY"] : []),
@@ -295,51 +353,19 @@ async function loadStatus() {
     ];
     const missingText = missing.length ? `Missing in this deployment: ${missing.join(", ")}.` : "";
     $("sarvam-key-status").textContent = configured
-      ? "Cloud demo ready · Sarvam AI speech + Groq AI memory and chat. Keys remain on the Vercel server."
+      ? "Cloud demo ready · Sarvam handles live transcription; Groq powers cleanup and chat. Memories stay in this browser."
       : missingText;
     setStatus(configured ? "Cloud demo ready" : "Demo needs setup", configured ? "" : "warn");
-    $("hint").textContent = "Cloud demo: Sarvam AI transcribes, Groq polishes and answers.";
+    $("hint").textContent = "Live audio streams securely to Sarvam. Groq answers questions about saved memories.";
   } catch (_) {
     setStatus("Demo API unavailable", "warn");
     $("sarvam-key-status").textContent = "The deployment could not reach /api/status. Check that this project is deployed from the repository root.";
   }
 }
 
-function setSarvamState(configured, current) {
-  const title = document.querySelector(".sarvam-title");
-  if (!title) return;
-  let badge = $("sarvam-current");
-  if (!badge) { badge = document.createElement("span"); badge.id = "sarvam-current"; title.append(badge); }
-  badge.textContent = current ? "Currently using (cloud model)" : "Saved (cloud model)";
-  badge.className = `sarvam-current${current ? " current" : ""}`;
-  badge.hidden = !configured;
-  const form = $("sarvam-form");
-  if (!form) return;
-  let change = $("sarvam-change");
-  if (!change) {
-    change = document.createElement("button"); change.id = "sarvam-change"; change.type = "button"; change.className = "sarvam-change"; change.textContent = "Change key";
-    change.addEventListener("click", () => { form.hidden = false; change.hidden = true; $("sarvam-key")?.focus(); });
-    form.parentElement.append(change);
-  }
-  let use = $("sarvam-use");
-  if (!use) {
-    use = document.createElement("button"); use.id = "sarvam-use"; use.type = "button"; use.className = "sarvam-use"; use.textContent = "Use Sarvam AI";
-    use.addEventListener("click", async () => { use.disabled = true; use.textContent = "Switching…"; await activateModel("asr_sarvam_ai"); use.disabled = false; use.textContent = "Use Sarvam AI"; });
-    form.parentElement.append(use);
-  }
-  form.hidden = configured && !change.dataset.editing;
-  change.hidden = !configured;
-  use.hidden = !configured || current;
-}
-$('sarvam-form')?.addEventListener('submit', saveSarvamKey);
 setStatus("Checking cloud demo…", "live");
-$("hint").textContent = "Cloud demo: Sarvam AI transcribes, Groq polishes and answers.";
-$("model-list").textContent = "Sarvam AI is the default speech model for this cloud demo.";
-$("llm-list").textContent = "Groq GPT-OSS 20B is the default chat and memory model for this cloud demo.";
-$("sarvam-form")?.remove();
-$("sarvam-key-status") && ($("sarvam-key-status").textContent = "Configured by the Vercel deployment owner. API keys are never entered in the demo.");
-$("model-setup")?.querySelector("h2") && ($("model-setup").querySelector("h2").textContent = "Cloud demo setup");
-$("model-setup")?.querySelector(".panel-section-heading + p") && ($("model-setup").querySelector(".panel-section-heading + p").textContent = "This demo uses Sarvam AI for speech and Groq for memory cleanup and chat. API keys stay on Vercel and are never entered in this browser.");
+$("hint").textContent = "Sarvam realtime transcription, local memories, and Groq chat.";
+$("sarvam-key-status").textContent = "API keys are managed by the deployment owner and stay on the server.";
 loadStatus();
 loadRecent();
 
